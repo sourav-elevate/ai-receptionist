@@ -1,24 +1,20 @@
 """
 Streaming voice agent for Vapi integration.
 
-Uses Anthropic's async streaming API so the first spoken word reaches
-the caller before the full response is ready — critical for < 1.2s
-perceived latency on a live call.
-
-Streaming flow for a booking query:
-  1. Vapi sends: "Can I book the 6pm Reformer Thursday?"
-  2. LLM immediately yields: "One sec, let me check."
-                              → Vapi TTS starts playing (~200ms in)
-  3. [tool: check_class_availability executes silently]
-  4. LLM yields: "That one's full — the 7pm has space, want that?"
-                              → Vapi speaks the answer
-  Total perceived latency from end of caller speech: ~600–900ms
+Lifecycle log events emitted per turn:
+  llm.start         — before each Anthropic streaming call
+  voice.first_token — milliseconds from llm.start to first token (THE latency KPI)
+  llm.end           — after the stream closes (duration, stop_reason, tool_calls)
+  tool.start        — before each tool executes
+  tool.end          — after each tool (duration, success)
+  voice.turn.end    — end of the full turn (total_ms, chars_streamed, iterations)
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import time
 import uuid
 from typing import AsyncIterator, Optional
 
@@ -28,33 +24,20 @@ from agent.agent import PilatesAgent
 from agent.providers.base import ToolCall
 from agent.tools import ALL_TOOLS
 from agent.voice_prompt import get_voice_system_prompt
+from config.logging_config import Timer
 from config.settings import Settings
 
 logger = logging.getLogger(__name__)
 
 MAX_TOOL_ITERATIONS = 8
-VOICE_MAX_TOKENS = 300   # voice answers are short; cap to keep latency tight
+VOICE_MAX_TOKENS = 300
 
 
 class VoiceAgent:
-    """
-    Wraps PilatesAgent for voice.  Uses an AsyncAnthropic client so
-    text tokens stream to Vapi as they arrive, instead of waiting for
-    the full response.
-
-    Tool execution reuses PilatesAgent._dispatch_tool() so all business
-    logic (booking, sheets, calendar) is shared with the text chat path.
-    """
-
     def __init__(self, pilates_agent: PilatesAgent, settings: Settings) -> None:
         self._agent = pilates_agent
         self._settings = settings
-        # Async Anthropic client — separate from the sync one in AnthropicProvider
         self._client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-
-    # ------------------------------------------------------------------
-    # Public
-    # ------------------------------------------------------------------
 
     async def stream_reply(
         self,
@@ -64,74 +47,130 @@ class VoiceAgent:
     ) -> AsyncIterator[str]:
         """
         Async generator — yields text tokens as they arrive from the LLM.
-        Vapi consumes these as SSE chunks and immediately feeds them to TTS.
 
-        call_id     : Vapi's call.id — used as session key for booking state
-        vapi_messages: full conversation history from Vapi (OpenAI format)
-        customer_phone: caller's number from Vapi call metadata (if available)
+        Key latency metric: voice.first_token.latency_ms
+        Everything else is context for debugging.
         """
+        turn_start = time.perf_counter()
+
         session = self._agent._get_or_create_session(call_id)
         if customer_phone and not session.customer_phone:
             session.customer_phone = customer_phone
-            logger.info("Voice call %s from %s", call_id, customer_phone)
+            logger.info("voice.caller_identified", extra={"phone": customer_phone})
 
-        # Vapi sends OpenAI-format messages; strip the system turn (we own it)
         messages = [m for m in vapi_messages if m.get("role") != "system"]
         system = get_voice_system_prompt(self._settings.timezone)
         iterations = 0
+        total_chars = 0
 
         while iterations < MAX_TOOL_ITERATIONS:
             iterations += 1
             tool_calls: list[ToolCall] = []
+            iter_chars = 0
+            first_token_logged = False
+            llm_start = time.perf_counter()
 
-            # ── Stream one LLM turn ────────────────────────────────────
-            async with self._client.messages.stream(
-                model=self._settings.anthropic_model,
-                max_tokens=VOICE_MAX_TOKENS,
-                system=system,
-                tools=ALL_TOOLS,
-                messages=self._strip_tool_name_field(messages),
-            ) as stream:
-                # Yield text tokens the moment they arrive
-                async for text in stream.text_stream:
-                    yield text
+            logger.info(
+                "llm.start",
+                extra={
+                    "model": self._settings.anthropic_model,
+                    "messages": len(messages),
+                    "tools": len(ALL_TOOLS),
+                    "iteration": iterations,
+                },
+            )
 
-                final_message = await stream.get_final_message()
+            try:
+                async with self._client.messages.stream(
+                    model=self._settings.anthropic_model,
+                    max_tokens=VOICE_MAX_TOKENS,
+                    system=system,
+                    tools=ALL_TOOLS,
+                    messages=self._strip_tool_name_field(messages),
+                ) as stream:
+                    async for text in stream.text_stream:
+                        if not first_token_logged:
+                            latency_ms = round((time.perf_counter() - llm_start) * 1000)
+                            logger.info(
+                                "voice.first_token",
+                                extra={"latency_ms": latency_ms, "iteration": iterations},
+                            )
+                            first_token_logged = True
+                        iter_chars += len(text)
+                        total_chars += len(text)
+                        yield text
 
-            # Append the full assistant turn to our working messages
-            messages = messages + [
-                {"role": "assistant", "content": final_message.content}
-            ]
+                    final_message = await stream.get_final_message()
 
-            # Collect any tool calls from the response
+            except Exception as exc:
+                logger.exception("voice.stream.error", extra={"error": str(exc), "iteration": iterations})
+                yield "Sorry, I hit a technical issue. Let me have someone call you right back."
+                break
+
+            llm_duration = round((time.perf_counter() - llm_start) * 1000)
+
             for block in final_message.content:
                 if hasattr(block, "type") and block.type == "tool_use":
-                    tool_calls.append(
-                        ToolCall(id=block.id, name=block.name, input=block.input)
-                    )
+                    tool_calls.append(ToolCall(id=block.id, name=block.name, input=block.input))
+
+            logger.info(
+                "llm.end",
+                extra={
+                    "duration_ms": llm_duration,
+                    "stop_reason": "tool_use" if tool_calls else "end_turn",
+                    "tool_calls": len(tool_calls),
+                    "text_len": iter_chars,
+                    "iteration": iterations,
+                },
+            )
+
+            messages = messages + [{"role": "assistant", "content": final_message.content}]
 
             if not tool_calls:
-                break   # no more tools — final text was already streamed
+                break
 
-            # ── Execute tools (sync, fast) ─────────────────────────────
+            # ── Execute tools ──────────────────────────────────────────
             tool_results: list[dict] = []
             for tc in tool_calls:
-                result = self._agent._dispatch_tool(session, tc.name, tc.input)
+                logger.debug("tool.args", extra={"tool": tc.name, "args": tc.input})
+                logger.info("tool.start", extra={"tool": tc.name, "iteration": iterations})
+
+                with Timer() as tool_timer:
+                    result = self._agent._dispatch_tool(session, tc.name, tc.input)
+
+                success = "error" not in result
+                logger.info(
+                    "tool.end",
+                    extra={
+                        "tool": tc.name,
+                        "duration_ms": tool_timer.elapsed_ms,
+                        "success": success,
+                        "iteration": iterations,
+                    },
+                )
+
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": tc.id,
-                    "tool_name": tc.name,   # used by Gemini; stripped for Anthropic
+                    "tool_name": tc.name,
                     "content": json.dumps(result, default=str),
                 })
-                logger.info("Voice tool %s → %s", tc.name, result)
 
             messages = messages + [
                 {"role": "user", "content": self._strip_tool_name_field_in_results(tool_results)}
             ]
 
-        # ── Update session with plain text turns only ──────────────────
-        # Session.messages tracks the conversation for potential re-use.
-        # We store only the text turns Vapi already knows about.
+        # ── Turn complete ──────────────────────────────────────────────
+        total_ms = round((time.perf_counter() - turn_start) * 1000)
+        logger.info(
+            "voice.turn.end",
+            extra={
+                "total_ms": total_ms,
+                "chars_streamed": total_chars,
+                "iterations": iterations,
+            },
+        )
+
         session.messages = [m for m in messages if _is_text_turn(m)]
 
     # ------------------------------------------------------------------
@@ -140,7 +179,6 @@ class VoiceAgent:
 
     @staticmethod
     def _strip_tool_name_field(messages: list[dict]) -> list[dict]:
-        """Remove the `tool_name` key from tool_result blocks before sending to Anthropic."""
         result = []
         for msg in messages:
             content = msg.get("content")
@@ -162,7 +200,6 @@ class VoiceAgent:
 
 
 def _is_text_turn(msg: dict) -> bool:
-    """True for plain string turns (not tool-use / tool-result block turns)."""
     content = msg.get("content")
     if isinstance(content, str):
         return True

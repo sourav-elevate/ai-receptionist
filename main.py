@@ -13,13 +13,15 @@ from agent.voice_agent import VoiceAgent
 from api.routes import router as chat_router, set_agent
 from api.vapi_routes import router as vapi_router, set_voice_agent
 from config.settings import get_settings
+
+# Logging must be configured before any other import that uses a logger
+_settings_for_log = get_settings()
+from config.logging_config import setup_logging
+setup_logging(level=_settings_for_log.log_level, fmt=_settings_for_log.log_format)
+
 from integrations.google_calendar import GoogleCalendarClient
 from integrations.google_sheets import GoogleSheetsClient
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
-)
 logger = logging.getLogger(__name__)
 
 

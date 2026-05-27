@@ -1,4 +1,4 @@
-"""FastAPI routes for the Solstice Pilates AI receptionist."""
+"""FastAPI routes for the Solstice Pilates AI receptionist (text chat)."""
 
 from __future__ import annotations
 
@@ -7,16 +7,16 @@ import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from agent.agent import PilatesAgent
+from config.log_context import bind as bind_context
+from config.logging_config import Timer
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Agent instance is injected via dependency
 _agent: Optional[PilatesAgent] = None
 
 
@@ -38,13 +38,13 @@ def get_agent() -> PilatesAgent:
 
 class ChatRequest(BaseModel):
     session_id: Optional[str] = None
-    message: str
+    message: str = Field(..., max_length=2000)
 
 
 class ChatResponse(BaseModel):
     session_id: str
     reply: str
-    provider: str  # which LLM backend answered
+    provider: str
 
 
 class SessionResponse(BaseModel):
@@ -67,33 +67,42 @@ async def health(agent: PilatesAgent = Depends(get_agent)):
 
 @router.post("/session", response_model=SessionResponse)
 async def create_session(agent: PilatesAgent = Depends(get_agent)):
-    """Create a new conversation session."""
     session_id = agent.new_session()
     return SessionResponse(session_id=session_id)
 
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat(body: ChatRequest, agent: PilatesAgent = Depends(get_agent)):
-    """Send a message and get a reply. If session_id is omitted a new one is created."""
     session_id = body.session_id or agent.new_session()
-    try:
-        # Fix #2 — run the synchronous agent (which makes blocking Google API
-        # and LLM calls) in a worker thread so the event loop stays free to
-        # handle other incoming requests while this one is in flight.
-        reply = await asyncio.to_thread(agent.chat, session_id, body.message)
-    except Exception as exc:
-        logger.exception("Agent error: %s", exc)
-        raise HTTPException(status_code=500, detail="Agent error. Please try again.")
+
+    # Bind context so every log line down the stack carries session_id + channel
+    bind_context(call_id=session_id, session_id=session_id, channel="text")
+
+    logger.info(
+        "request.start",
+        extra={"endpoint": "/chat", "msg_len": len(body.message), "session_id": session_id},
+    )
+
+    with Timer() as t:
+        try:
+            reply = await asyncio.to_thread(agent.chat, session_id, body.message)
+        except Exception as exc:
+            logger.exception("request.error", extra={"error": str(exc)})
+            raise HTTPException(status_code=500, detail="Agent error. Please try again.")
+
+    logger.info(
+        "request.done",
+        extra={"duration_ms": t.elapsed_ms, "reply_len": len(reply), "status": 200},
+    )
+
     return ChatResponse(session_id=session_id, reply=reply, provider=agent.provider_name)
 
 
 @router.get("/session/{session_id}/history")
 async def get_history(session_id: str, agent: PilatesAgent = Depends(get_agent)):
-    """Return the conversation history for a session (debug endpoint)."""
     session = agent.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    # Return only text turns for readability
     turns = []
     for msg in session.messages:
         content = msg["content"]

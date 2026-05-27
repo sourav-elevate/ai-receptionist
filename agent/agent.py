@@ -14,6 +14,7 @@ from typing import Any, Optional
 from agent.prompts import get_system_prompt
 from agent.providers import LLMProvider, create_provider
 from agent.tools import ALL_TOOLS
+from config.logging_config import Timer
 from config.settings import Settings
 from config.studio_info import STUDIO_INFO
 from integrations.google_calendar import GoogleCalendarClient
@@ -89,71 +90,125 @@ class PilatesAgent:
     def _get_or_create_session(self, session_id: str) -> Session:
         if session_id not in self._sessions:
             self._sessions[session_id] = Session(session_id=session_id)
+            logger.info("session.created", extra={"session_id": session_id})
         return self._sessions[session_id]
 
     def _agent_loop(self, session: Session) -> str:
         system_prompt = get_system_prompt(self._settings.timezone)
         iterations = 0
 
-        while iterations < self.MAX_TOOL_ITERATIONS:
-            iterations += 1
-            response = self._provider.complete(
-                system=system_prompt,
-                messages=session.messages,
-                tools=ALL_TOOLS,
-                max_tokens=self._settings.max_tokens,
-            )
-            session.messages.append(self._provider.format_assistant_message(response))
+        with Timer() as loop_timer:
+            while iterations < self.MAX_TOOL_ITERATIONS:
+                iterations += 1
 
-            if not response.has_tool_calls:
-                return response.text or ""
+                logger.info(
+                    "llm.start",
+                    extra={
+                        "model": self._settings.model,
+                        "messages": len(session.messages),
+                        "tools": len(ALL_TOOLS),
+                        "iteration": iterations,
+                    },
+                )
 
-            tool_results: list[dict] = []
-            for tc in response.tool_calls:
-                result = self._dispatch_tool(session, tc.name, tc.input)
-                tool_results.append({
-                    "tool_use_id": tc.id,
-                    "tool_name": tc.name,
-                    "content": json.dumps(result, default=str),
-                })
-            session.messages.append(self._provider.format_tool_result_message(tool_results))
+                with Timer() as llm_timer:
+                    response = self._provider.complete(
+                        system=system_prompt,
+                        messages=session.messages,
+                        tools=ALL_TOOLS,
+                        max_tokens=self._settings.max_tokens,
+                    )
 
-        logger.error("Max tool iterations (%d) reached for session %s", self.MAX_TOOL_ITERATIONS, session.session_id)
-        return "I'm sorry, I ran into an issue. Let me have someone from the team call you back."
+                logger.info(
+                    "llm.end",
+                    extra={
+                        "duration_ms": llm_timer.elapsed_ms,
+                        "stop_reason": "tool_use" if response.has_tool_calls else "end_turn",
+                        "tool_calls": len(response.tool_calls),
+                        "text_len": len(response.text or ""),
+                        "iteration": iterations,
+                    },
+                )
+
+                session.messages.append(self._provider.format_assistant_message(response))
+
+                if not response.has_tool_calls:
+                    break
+
+                tool_results: list[dict] = []
+                for tc in response.tool_calls:
+                    result = self._dispatch_tool(session, tc.name, tc.input)
+                    tool_results.append({
+                        "tool_use_id": tc.id,
+                        "tool_name": tc.name,
+                        "content": json.dumps(result, default=str),
+                    })
+                session.messages.append(self._provider.format_tool_result_message(tool_results))
+            else:
+                logger.error(
+                    "turn.max_iterations",
+                    extra={"limit": self.MAX_TOOL_ITERATIONS, "session_id": session.session_id},
+                )
+                return "I'm sorry, I ran into an issue. Let me have someone from the team call you back."
+
+        reply = response.text or ""
+        logger.info(
+            "turn.end",
+            extra={
+                "duration_ms": loop_timer.elapsed_ms,
+                "iterations": iterations,
+                "reply_len": len(reply),
+            },
+        )
+        return reply
 
     # ------------------------------------------------------------------
     # Tool dispatcher
     # ------------------------------------------------------------------
 
     def _dispatch_tool(self, session: Session, name: str, args: dict[str, Any]) -> dict:
-        logger.info("Tool call: %s %s", name, args)
-        try:
-            match name:
-                case "check_class_availability":
-                    return self._check_availability(**args)
-                case "list_available_classes":
-                    return self._list_classes(**args)
-                case "reserve_spot":
-                    return self._reserve_spot(session, **args)
-                case "confirm_booking":
-                    return self._confirm_booking(session, **args)
-                case "find_customer_bookings":
-                    return self._find_bookings(session, **args)
-                case "reschedule_booking":
-                    return self._reschedule(session, **args)
-                case "cancel_booking":
-                    return self._cancel_booking(session, **args)
-                case "get_studio_info":
-                    return self._get_info(**args)
-                case "log_call":
-                    return self._log_call(session, **args)
-                case "escalate_to_human":
-                    return self._escalate(session, **args)
-                case _:
-                    return {"error": f"Unknown tool: {name}"}
-        except Exception as exc:
-            logger.exception("Tool %s failed: %s", name, exc)
-            return {"error": str(exc)}
+        # Log args at DEBUG so they don't appear in INFO production logs
+        logger.debug("tool.args", extra={"tool": name, "args": args})
+        logger.info("tool.start", extra={"tool": name})
+
+        with Timer() as t:
+            try:
+                match name:
+                    case "check_class_availability":
+                        result = self._check_availability(**args)
+                    case "list_available_classes":
+                        result = self._list_classes(**args)
+                    case "reserve_spot":
+                        result = self._reserve_spot(session, **args)
+                    case "confirm_booking":
+                        result = self._confirm_booking(session, **args)
+                    case "find_customer_bookings":
+                        result = self._find_bookings(session, **args)
+                    case "reschedule_booking":
+                        result = self._reschedule(session, **args)
+                    case "cancel_booking":
+                        result = self._cancel_booking(session, **args)
+                    case "get_studio_info":
+                        result = self._get_info(**args)
+                    case "log_call":
+                        result = self._log_call(session, **args)
+                    case "escalate_to_human":
+                        result = self._escalate(session, **args)
+                    case _:
+                        result = {"error": f"Unknown tool: {name}"}
+            except Exception as exc:
+                logger.exception("tool.error", extra={"tool": name, "error": str(exc)})
+                return {"error": str(exc)}
+
+        success = "error" not in result
+        logger.info(
+            "tool.end",
+            extra={"tool": name, "duration_ms": t.elapsed_ms, "success": success},
+        )
+        if not success:
+            logger.warning("tool.failed", extra={"tool": name, "error": result["error"]})
+
+        return result
 
     # ------------------------------------------------------------------
     # Tool implementations
@@ -388,8 +443,13 @@ class PilatesAgent:
         if customer_name:
             session.customer_name = customer_name
         logger.warning(
-            "ESCALATION [%s] phone=%s name=%s reason=%s",
-            urgency.upper(), customer_phone, customer_name, reason,
+            "escalation",
+            extra={
+                "urgency": urgency,
+                "phone": customer_phone,
+                "customer_name": customer_name or "-",
+                "reason": reason,
+            },
         )
         return {
             "escalated": True,

@@ -34,6 +34,10 @@ class Settings(BaseSettings):
     # Agent tuning (shared between text + voice)
     max_tokens: int = 1024
 
+    # Logging
+    log_level: str = "INFO"    # DEBUG | INFO | WARNING | ERROR
+    log_format: str = "pretty" # pretty (dev) | json (production)
+
     # ── Vapi voice integration (Phase 2) ──────────────────────────────
     # vapi_api_key    : get from app.vapi.ai → Account → API Keys
     # server_base_url : public URL where Vapi can reach this server

@@ -1,13 +1,8 @@
 """
 Vapi integration routes.
 
-POST /vapi/chat    — Custom LLM endpoint.  Vapi sends every caller turn
-                     here in OpenAI chat-completion format and expects a
-                     streaming SSE response.
-
-POST /vapi/webhook — Event handler.  Vapi posts end-of-call-report here
-                     so we can finalise the call log in Google Sheets even
-                     when the caller hangs up before the agent calls log_call.
+POST /vapi/chat    — Custom LLM endpoint (SSE streaming).
+POST /vapi/webhook — End-of-call events.
 """
 
 from __future__ import annotations
@@ -21,12 +16,13 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from agent.voice_agent import VoiceAgent
+from config.log_context import bind as bind_context
+from config.logging_config import Timer
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/vapi")
 
-# Injected from main.py at startup
 _voice_agent: Optional[VoiceAgent] = None
 
 
@@ -47,20 +43,6 @@ def get_voice_agent() -> VoiceAgent:
 
 @router.post("/chat")
 async def vapi_chat(request: Request) -> StreamingResponse:
-    """
-    Vapi calls this for every caller turn.
-
-    Request body (OpenAI chat completion format):
-        {
-          "model": "...",
-          "messages": [{"role": "user", "content": "..."}, ...],
-          "stream": true,
-          "call": {"id": "...", "customer": {"number": "+1415..."}},
-          "metadata": {}
-        }
-
-    Response: SSE stream of OpenAI chat.completion.chunk objects.
-    """
     try:
         body = await request.json()
     except Exception:
@@ -69,14 +51,18 @@ async def vapi_chat(request: Request) -> StreamingResponse:
     call_info = body.get("call", {})
     call_id = call_info.get("id") or uuid.uuid4().hex
     messages = body.get("messages", [])
-
-    # Extract caller's phone number from Vapi call metadata
     customer_phone: Optional[str] = (
         call_info.get("customer", {}).get("number")
         or call_info.get("phoneNumber", {}).get("number")
     )
 
-    logger.info("Vapi call %s  phone=%s  turns=%d", call_id, customer_phone, len(messages))
+    # Bind context so all log lines for this turn carry call_id and "voice"
+    bind_context(call_id=call_id, session_id=call_id, channel="voice")
+
+    logger.info(
+        "vapi.turn.start",
+        extra={"turns": len(messages), "phone": customer_phone or "-"},
+    )
 
     agent = get_voice_agent()
     stream = agent.stream_reply(call_id, messages, customer_phone)
@@ -87,7 +73,7 @@ async def vapi_chat(request: Request) -> StreamingResponse:
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",   # disable nginx buffering
+            "X-Accel-Buffering": "no",
         },
     )
 
@@ -96,40 +82,32 @@ async def _to_openai_sse(
     text_stream: AsyncIterator[str],
     call_id: str,
 ) -> AsyncIterator[str]:
-    """
-    Wrap text token chunks in OpenAI SSE chat.completion.chunk format.
-    Vapi reads these chunks and feeds them to TTS as they arrive.
-    """
     chunk_id = f"chatcmpl-{call_id[:8]}"
 
-    async for text in text_stream:
-        if not text:
-            continue
-        payload = {
-            "id": chunk_id,
-            "object": "chat.completion.chunk",
-            "model": "solstice-v1",
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {"role": "assistant", "content": text},
-                    "finish_reason": None,
-                }
-            ],
-        }
-        yield f"data: {json.dumps(payload)}\n\n"
+    with Timer() as t:
+        async for text in text_stream:
+            if not text:
+                continue
+            payload = {
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "model": "solstice-v1",
+                "choices": [
+                    {"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": None}
+                ],
+            }
+            yield f"data: {json.dumps(payload)}\n\n"
 
-    # Final stop chunk
     stop_payload = {
         "id": chunk_id,
         "object": "chat.completion.chunk",
         "model": "solstice-v1",
-        "choices": [
-            {"index": 0, "delta": {}, "finish_reason": "stop"}
-        ],
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
     }
     yield f"data: {json.dumps(stop_payload)}\n\n"
     yield "data: [DONE]\n\n"
+
+    logger.info("vapi.turn.done", extra={"duration_ms": t.elapsed_ms})
 
 
 # ------------------------------------------------------------------
@@ -138,14 +116,6 @@ async def _to_openai_sse(
 
 @router.post("/webhook")
 async def vapi_webhook(request: Request) -> dict:
-    """
-    Receives Vapi server messages (end-of-call-report, etc).
-
-    Vapi sends an end-of-call-report when the call ends regardless of
-    how it ended (caller hangup, max duration, agent goodbye).
-    We use this to ensure log_call is always written — even if the
-    caller hung up before the agent finished.
-    """
     try:
         body = await request.json()
     except Exception:
@@ -154,17 +124,17 @@ async def vapi_webhook(request: Request) -> dict:
     message = body.get("message", {})
     event_type = message.get("type")
 
-    logger.info("Vapi webhook: %s", event_type)
+    logger.info("vapi.webhook", extra={"event_type": event_type or "-"})
 
     if event_type == "end-of-call-report":
         call = message.get("call", {})
         call_id = call.get("id")
+        bind_context(call_id=call_id or "-", channel="voice")
 
         try:
             agent = get_voice_agent()
             session = agent._agent.get_session(call_id)
             if session and not session.logged:
-                # Agent didn't get to call log_call — do it now
                 phone = session.customer_phone or "unknown"
                 name = session.customer_name or "unknown"
                 ended_reason = message.get("endedReason", "unknown")
@@ -175,11 +145,11 @@ async def vapi_webhook(request: Request) -> dict:
                     summary=summary,
                     actions=session.actions_taken,
                     escalated=session.escalated,
-                    escalation_reason="call ended before agent logged" if not session.logged else "",
+                    escalation_reason="call ended before agent logged",
                 )
                 session.logged = True
-                logger.info("Fallback log_call written for call %s", call_id)
+                logger.info("vapi.fallback_logged", extra={"phone": phone, "ended_reason": ended_reason})
         except Exception as exc:
-            logger.exception("Webhook log_call failed for call %s: %s", call_id, exc)
+            logger.exception("vapi.webhook.error", extra={"error": str(exc)})
 
     return {"ok": True}
