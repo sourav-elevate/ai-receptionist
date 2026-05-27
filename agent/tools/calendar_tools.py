@@ -5,7 +5,7 @@ CALENDAR_TOOLS: list[dict] = [
         "name": "check_class_availability",
         "description": (
             "Check how many spots remain in a specific class. "
-            "Call this before booking, or when a caller asks if a class is open."
+            "Call this before reserving, or when a caller asks if a class is open."
         ),
         "input_schema": {
             "type": "object",
@@ -52,10 +52,12 @@ CALENDAR_TOOLS: list[dict] = [
         },
     },
     {
-        "name": "book_class",
+        "name": "reserve_spot",
         "description": (
-            "Book a class for a caller. "
-            "Only call this after (1) confirming availability and (2) collecting name + phone."
+            "Hold a spot the MOMENT the caller says yes to a class — "
+            "call this BEFORE asking for their name and phone. "
+            "The spot is locked for 10 minutes. "
+            "Returns a reservation_id you MUST pass to confirm_booking once you have their details."
         ),
         "input_schema": {
             "type": "object",
@@ -66,10 +68,28 @@ CALENDAR_TOOLS: list[dict] = [
                 },
                 "date": {"type": "string", "description": "YYYY-MM-DD"},
                 "time": {"type": "string", "description": "HH:MM 24-hour"},
-                "customer_name": {"type": "string"},
-                "customer_phone": {"type": "string", "description": "Caller's phone number"},
             },
-            "required": ["class_type", "date", "time", "customer_name", "customer_phone"],
+            "required": ["class_type", "date", "time"],
+        },
+    },
+    {
+        "name": "confirm_booking",
+        "description": (
+            "Finalise a pending reservation after collecting the caller's name and phone. "
+            "Must be called within 10 minutes of reserve_spot or the spot is released. "
+            "This is what actually completes the booking."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "reservation_id": {
+                    "type": "string",
+                    "description": "The reservation_id returned by reserve_spot",
+                },
+                "customer_name": {"type": "string"},
+                "customer_phone": {"type": "string"},
+            },
+            "required": ["reservation_id", "customer_name", "customer_phone"],
         },
     },
     {

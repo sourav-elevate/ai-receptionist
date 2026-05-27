@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Optional
 
@@ -76,7 +77,10 @@ async def chat(body: ChatRequest, agent: PilatesAgent = Depends(get_agent)):
     """Send a message and get a reply. If session_id is omitted a new one is created."""
     session_id = body.session_id or agent.new_session()
     try:
-        reply = agent.chat(session_id, body.message)
+        # Fix #2 — run the synchronous agent (which makes blocking Google API
+        # and LLM calls) in a worker thread so the event loop stays free to
+        # handle other incoming requests while this one is in flight.
+        reply = await asyncio.to_thread(agent.chat, session_id, body.message)
     except Exception as exc:
         logger.exception("Agent error: %s", exc)
         raise HTTPException(status_code=500, detail="Agent error. Please try again.")

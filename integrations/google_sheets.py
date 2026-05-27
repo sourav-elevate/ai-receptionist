@@ -1,32 +1,57 @@
-"""Google Sheets client for contacts, bookings, and call log tracking."""
+"""Google Sheets client — contacts, bookings (two-phase), and call log."""
 
 from __future__ import annotations
 
+import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+logger = logging.getLogger(__name__)
+
+# How long a pending reservation holds a spot before it auto-expires.
+RESERVATION_TIMEOUT_MINUTES = 10
+
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _utcnow_plus(minutes: int) -> str:
+    return (datetime.now(timezone.utc) + timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 class GoogleSheetsClient:
     SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-    # Tab ranges
     CONTACTS_TAB = "Contacts"
     BOOKINGS_TAB = "Bookings"
     CALL_LOG_TAB = "CallLog"
 
-    # Header rows — order matters; must match append/update logic
-    CONTACTS_HEADERS = ["phone", "name", "email", "first_call_date", "last_call_date", "total_calls", "notes"]
-    BOOKINGS_HEADERS = ["booking_id", "event_id", "customer_phone", "customer_name", "class_name", "class_datetime", "booked_at", "status", "notes"]
-    CALL_LOG_HEADERS = ["timestamp", "phone", "name", "summary", "actions_taken", "escalated", "escalation_reason"]
+    CONTACTS_HEADERS = [
+        "phone", "name", "email",
+        "first_call_date", "last_call_date", "total_calls", "notes",
+    ]
+
+    # Two new columns (reserved_at, expires_at) support the two-phase reservation.
+    # Column map:
+    #   A=booking_id  B=event_id  C=customer_phone  D=customer_name
+    #   E=class_name  F=class_datetime  G=booked_at  H=status
+    #   I=reserved_at  J=expires_at  K=notes
+    BOOKINGS_HEADERS = [
+        "booking_id", "event_id", "customer_phone", "customer_name",
+        "class_name", "class_datetime", "booked_at", "status",
+        "reserved_at", "expires_at", "notes",
+    ]
+
+    CALL_LOG_HEADERS = [
+        "timestamp", "phone", "name", "summary",
+        "actions_taken", "escalated", "escalation_reason",
+    ]
 
     def __init__(self, service_account_file: str, sheet_id: str):
         self.sheet_id = sheet_id
@@ -37,33 +62,38 @@ class GoogleSheetsClient:
         self._sheets = svc.spreadsheets()
 
     # ------------------------------------------------------------------
-    # Sheet initialisation (called once by setup script)
+    # Initialisation + schema migration
     # ------------------------------------------------------------------
 
     def ensure_tabs_exist(self) -> None:
-        """Create tabs and header rows if they don't exist yet."""
+        """Create tabs if missing, write headers, and migrate old schemas."""
         meta = self._sheets.get(spreadsheetId=self.sheet_id).execute()
-        existing = {s["properties"]["title"] for s in meta["sheets"]}
+        existing_tabs = {s["properties"]["title"] for s in meta["sheets"]}
 
-        tabs_to_create = []
-        for tab in [self.CONTACTS_TAB, self.BOOKINGS_TAB, self.CALL_LOG_TAB]:
-            if tab not in existing:
-                tabs_to_create.append({"addSheet": {"properties": {"title": tab}}})
-
-        if tabs_to_create:
+        new_tabs = [
+            tab for tab in [self.CONTACTS_TAB, self.BOOKINGS_TAB, self.CALL_LOG_TAB]
+            if tab not in existing_tabs
+        ]
+        if new_tabs:
             self._sheets.batchUpdate(
-                spreadsheetId=self.sheet_id, body={"requests": tabs_to_create}
+                spreadsheetId=self.sheet_id,
+                body={"requests": [{"addSheet": {"properties": {"title": t}}} for t in new_tabs]},
             ).execute()
 
-        # Write headers if rows are empty
         for tab, headers in [
-            (self.CONTACTS_TAB, self.CONTACTS_HEADERS),
-            (self.BOOKINGS_TAB, self.BOOKINGS_HEADERS),
-            (self.CALL_LOG_TAB, self.CALL_LOG_HEADERS),
+            (self.CONTACTS_TAB,  self.CONTACTS_HEADERS),
+            (self.BOOKINGS_TAB,  self.BOOKINGS_HEADERS),
+            (self.CALL_LOG_TAB,  self.CALL_LOG_HEADERS),
         ]:
-            existing_values = self._get(f"{tab}!1:1")
-            if not existing_values or not existing_values[0]:
+            existing_row = self._get(f"{tab}!1:1")
+            if not existing_row or not existing_row[0]:
                 self._append(f"{tab}!A1", [headers])
+            elif existing_row[0] != headers:
+                # Schema changed (e.g. reserved_at/expires_at were added).
+                # Overwrite header row; existing data rows get empty cells for
+                # new columns, which is safe — all readers pad with "".
+                self._update(f"{tab}!A1", [headers])
+                logger.info("Migrated %s headers: %s → %s columns", tab, len(existing_row[0]), len(headers))
 
     # ------------------------------------------------------------------
     # Contacts
@@ -82,69 +112,155 @@ class GoogleSheetsClient:
         return None
 
     def upsert_contact(self, phone: str, name: str = "", email: str = "") -> dict:
-        """Find or create a contact, incrementing call count each time."""
         existing = self.find_contact(phone)
         now = _utcnow()
 
         if existing:
             row_num = existing["_row"]
             total_calls = int(existing.get("total_calls") or 0) + 1
-            # Update name if we now know it and didn't before
             new_name = name if name else existing.get("name", "")
-            self._update(f"{self.CONTACTS_TAB}!B{row_num}:F{row_num}", [[new_name, existing.get("email", ""), existing.get("first_call_date", now), now, str(total_calls)]])
+            self._update(
+                f"{self.CONTACTS_TAB}!B{row_num}:F{row_num}",
+                [[new_name, existing.get("email", ""), existing.get("first_call_date", now), now, str(total_calls)]],
+            )
             existing.update({"name": new_name, "last_call_date": now, "total_calls": str(total_calls)})
             return existing
 
         self._append(f"{self.CONTACTS_TAB}!A1", [[phone, name, email, now, now, "1", ""]])
-        return {"phone": phone, "name": name, "email": email, "first_call_date": now, "last_call_date": now, "total_calls": "1", "notes": ""}
+        return {"phone": phone, "name": name, "email": email,
+                "first_call_date": now, "last_call_date": now, "total_calls": "1", "notes": ""}
 
     # ------------------------------------------------------------------
-    # Bookings
+    # Bookings — two-phase (Option B)
     # ------------------------------------------------------------------
 
-    def create_booking(
+    def create_pending_booking(
         self,
         event_id: str,
-        customer_phone: str,
-        customer_name: str,
         class_name: str,
         class_datetime: str,
+        timeout_minutes: int = RESERVATION_TIMEOUT_MINUTES,
     ) -> str:
+        """
+        Phase 1 — write a PENDING row that holds the spot immediately.
+        The row counts toward capacity until it expires or is confirmed.
+        Returns the booking_id (used as reservation_id by the caller).
+        """
         booking_id = uuid.uuid4().hex[:8].upper()
         now = _utcnow()
+        expires = _utcnow_plus(timeout_minutes)
         self._append(
             f"{self.BOOKINGS_TAB}!A1",
-            [[booking_id, event_id, customer_phone, customer_name, class_name, class_datetime, now, "active", ""]],
+            [[booking_id, event_id, "", "", class_name, class_datetime,
+              now, "pending", now, expires, ""]],
         )
+        logger.info("Pending booking %s created for event %s (expires %s)", booking_id, event_id, expires)
         return booking_id
 
-    def get_booking_count(self, event_id: str) -> int:
-        rows = self._get(f"{self.BOOKINGS_TAB}!A:I")
+    def confirm_booking(
+        self,
+        booking_id: str,
+        customer_name: str,
+        customer_phone: str,
+    ) -> bool:
+        """
+        Phase 2 — attach the caller's details and flip status to ACTIVE.
+        Returns False if the reservation is not found, already used, or expired.
+        """
+        rows = self._get(f"{self.BOOKINGS_TAB}!A:K")
         if len(rows) <= 1:
-            return 0
+            return False
         headers = rows[0]
-        count = 0
+        now = _utcnow()
+
+        for idx, row in enumerate(rows[1:], start=2):
+            data = self._row_to_dict(headers, row)
+            if data.get("booking_id") != booking_id:
+                continue
+            if data.get("status") != "pending":
+                logger.warning("confirm_booking: %s status is %s, not pending", booking_id, data.get("status"))
+                return False
+            expires_at = data.get("expires_at", "")
+            if expires_at and expires_at < now:
+                logger.warning("confirm_booking: %s expired at %s", booking_id, expires_at)
+                self._update(f"{self.BOOKINGS_TAB}!H{idx}", [["expired"]])
+                return False
+
+            # Write customer details (C, D) and flip status (H) to active
+            self._update(f"{self.BOOKINGS_TAB}!C{idx}:D{idx}", [[customer_phone, customer_name]])
+            self._update(f"{self.BOOKINGS_TAB}!H{idx}", [["active"]])
+            logger.info("Booking %s confirmed for %s (%s)", booking_id, customer_name, customer_phone)
+            return True
+
+        return False
+
+    def get_booking_count(self, event_id: str) -> int:
+        """Single-event wrapper around the batch method. Used by reserve_spot."""
+        return self.get_booking_counts_batch([event_id]).get(event_id, 0)
+
+    def get_booking_counts_batch(self, event_ids: list[str]) -> dict[str, int]:
+        """
+        Read the Bookings sheet ONCE and return {event_id: count} for every
+        requested event.  Counts active rows + non-expired pending rows.
+
+        Replaces N separate get_booking_count calls in _list_classes, cutting
+        the Sheets API calls from N (one per event) down to 1.
+        """
+        if not event_ids:
+            return {}
+
+        rows = self._get(f"{self.BOOKINGS_TAB}!A:K")
+        counts: dict[str, int] = {eid: 0 for eid in event_ids}
+
+        if len(rows) <= 1:
+            return counts
+
+        headers = rows[0]
+        now = _utcnow()
+        id_set = set(event_ids)
+
         for row in rows[1:]:
             data = self._row_to_dict(headers, row)
-            if data.get("event_id") == event_id and data.get("status") == "active":
-                count += 1
-        return count
+            eid = data.get("event_id", "")
+            if eid not in id_set:
+                continue
+            status = data.get("status")
+            if status == "active":
+                counts[eid] += 1
+            elif status == "pending":
+                expires_at = data.get("expires_at", "")
+                if expires_at and expires_at > now:
+                    counts[eid] += 1
+
+        return counts
 
     def find_customer_bookings(self, phone: str) -> list[dict]:
-        rows = self._get(f"{self.BOOKINGS_TAB}!A:I")
+        """Return active + non-expired pending bookings for a phone number."""
+        rows = self._get(f"{self.BOOKINGS_TAB}!A:K")
         if len(rows) <= 1:
             return []
         headers = rows[0]
+        now = _utcnow()
         results = []
+
         for idx, row in enumerate(rows[1:], start=2):
             data = self._row_to_dict(headers, row)
-            if data.get("customer_phone") == phone and data.get("status") == "active":
+            if data.get("customer_phone") != phone:
+                continue
+            status = data.get("status")
+            if status == "active":
                 data["_row"] = idx
                 results.append(data)
+            elif status == "pending":
+                expires_at = data.get("expires_at", "")
+                if expires_at and expires_at > now:
+                    data["_row"] = idx
+                    results.append(data)
+
         return results
 
     def cancel_booking(self, booking_id: str) -> bool:
-        rows = self._get(f"{self.BOOKINGS_TAB}!A:I")
+        rows = self._get(f"{self.BOOKINGS_TAB}!A:K")
         if len(rows) <= 1:
             return False
         for idx, row in enumerate(rows[1:], start=2):
@@ -156,22 +272,15 @@ class GoogleSheetsClient:
     def reschedule_booking(
         self, booking_id: str, new_event_id: str, new_class_name: str, new_class_datetime: str
     ) -> bool:
-        rows = self._get(f"{self.BOOKINGS_TAB}!A:I")
+        rows = self._get(f"{self.BOOKINGS_TAB}!A:K")
         if len(rows) <= 1:
             return False
         headers = rows[0]
         for idx, row in enumerate(rows[1:], start=2):
             data = self._row_to_dict(headers, row)
-            if data.get("booking_id") == booking_id:
-                # Columns: B=event_id, E=class_name, F=class_datetime
-                self._update(
-                    f"{self.BOOKINGS_TAB}!B{idx}",
-                    [[new_event_id]],
-                )
-                self._update(
-                    f"{self.BOOKINGS_TAB}!E{idx}:F{idx}",
-                    [[new_class_name, new_class_datetime]],
-                )
+            if data.get("booking_id") == booking_id and data.get("status") == "active":
+                self._update(f"{self.BOOKINGS_TAB}!B{idx}", [[new_event_id]])
+                self._update(f"{self.BOOKINGS_TAB}!E{idx}:F{idx}", [[new_class_name, new_class_datetime]])
                 return True
         return False
 
@@ -188,10 +297,10 @@ class GoogleSheetsClient:
         escalated: bool = False,
         escalation_reason: str = "",
     ) -> None:
-        now = _utcnow()
         self._append(
             f"{self.CALL_LOG_TAB}!A1",
-            [[now, phone, name, summary, ", ".join(actions), "yes" if escalated else "no", escalation_reason]],
+            [[_utcnow(), phone, name, summary,
+              ", ".join(actions), "yes" if escalated else "no", escalation_reason]],
         )
 
     # ------------------------------------------------------------------
@@ -200,7 +309,9 @@ class GoogleSheetsClient:
 
     def _get(self, range_: str) -> list[list]:
         try:
-            result = self._sheets.values().get(spreadsheetId=self.sheet_id, range=range_).execute()
+            result = self._sheets.values().get(
+                spreadsheetId=self.sheet_id, range=range_
+            ).execute()
             return result.get("values", [])
         except HttpError as e:
             raise RuntimeError(f"Sheets API error: {e}") from e

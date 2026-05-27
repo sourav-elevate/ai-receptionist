@@ -7,17 +7,14 @@ from pathlib import Path
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
 
 from agent.agent import PilatesAgent
-from api.routes import router, set_agent
+from agent.voice_agent import VoiceAgent
+from api.routes import router as chat_router, set_agent
+from api.vapi_routes import router as vapi_router, set_voice_agent
 from config.settings import get_settings
 from integrations.google_calendar import GoogleCalendarClient
 from integrations.google_sheets import GoogleSheetsClient
-
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,10 +23,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# App factory
-# ---------------------------------------------------------------------------
-
 def create_app() -> FastAPI:
     settings = get_settings()
 
@@ -37,9 +30,10 @@ def create_app() -> FastAPI:
     if not Path(sa_file).exists():
         raise FileNotFoundError(
             f"Service account file not found: {sa_file}\n"
-            "Place your Google service account JSON at that path (see README)."
+            "Place your Google service account JSON at that path."
         )
 
+    # ── Google integrations ────────────────────────────────────────────
     calendar = GoogleCalendarClient(
         service_account_file=sa_file,
         calendar_id=settings.google_calendar_id,
@@ -49,28 +43,45 @@ def create_app() -> FastAPI:
         service_account_file=sa_file,
         sheet_id=settings.google_sheet_id,
     )
-    agent = PilatesAgent(settings=settings, calendar=calendar, sheets=sheets)
-    set_agent(agent)
 
+    # ── Phase 1: text chat agent ───────────────────────────────────────
+    pilates_agent = PilatesAgent(settings=settings, calendar=calendar, sheets=sheets)
+    set_agent(pilates_agent)
+
+    # ── Phase 2: voice agent (Vapi) ────────────────────────────────────
+    # VoiceAgent wraps PilatesAgent — shares all booking/sheets logic.
+    # Uses AsyncAnthropic for streaming so text tokens reach Vapi/TTS
+    # before the full response is ready.
+    if settings.anthropic_api_key:
+        voice_agent = VoiceAgent(pilates_agent=pilates_agent, settings=settings)
+        set_voice_agent(voice_agent)
+        logger.info("Vapi voice agent ready on /vapi/chat and /vapi/webhook")
+    else:
+        logger.warning(
+            "ANTHROPIC_API_KEY not set — Vapi voice routes will return 500. "
+            "Voice always uses Anthropic streaming regardless of LLM_PROVIDER."
+        )
+
+    # ── FastAPI app ────────────────────────────────────────────────────
     app = FastAPI(
         title="Solstice Pilates AI Receptionist",
-        description="Phase 1 — text chat interface",
-        version="1.0.0",
+        description="Phase 1: text chat  |  Phase 2: Vapi voice",
+        version="2.0.0",
     )
-    app.include_router(router)
 
-    # Serve the chat UI at "/"
+    app.include_router(chat_router)   # /chat, /session, /health
+    app.include_router(vapi_router)   # /vapi/chat, /vapi/webhook
+
     @app.get("/", response_class=HTMLResponse)
     async def index():
         html_path = Path(__file__).parent / "ui" / "index.html"
         return HTMLResponse(content=html_path.read_text())
 
-    logger.info("Solstice Pilates AI Receptionist ready.")
+    logger.info("Solstice Pilates AI Receptionist ready. Provider: %s", settings.llm_provider)
     return app
 
 
 app = create_app()
-
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
